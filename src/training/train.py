@@ -1,12 +1,5 @@
 """
 src/training/train.py
-
-Главный модуль обучения для дипломной работы.
-Поддерживает: EMNIST, любую модель из src/models/, ExperimentLogger + TensorBoard.
-
-Запуск:
-    python src/training/train.py
-    python src/training/train.py --experiment dropout --epochs 20 --lr 0.001
 """
 
 import argparse
@@ -16,188 +9,136 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
 from sklearn.metrics import confusion_matrix
 
-# Добавляем корень проекта в путь (чтобы работали импорты src/...)
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.logger import ExperimentLogger, Timer
+from src.dataset.emnist_loader import get_dataloaders, get_augmentation_info  # ← импорт
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 1. КОНФИГУРАЦИЯ
+# 1. РЕЕСТР МОДЕЛЕЙ
+# ══════════════════════════════════════════════════════════════════════
+
+def get_model(model_name: str, num_classes: int) -> nn.Module:
+    models = {
+        "simple_cnn":      "src.models.simple_cnn.SimpleCNN",
+        "improved_cnn_v2": "src.models.improved_cnn_v2.ImprovedCNN_v2",
+        "improved_cnn_v3": "src.models.improved_cnn_v3.ImprovedCNN_v3",
+        "improved_cnn_v4": "src.models.improved_cnn_v4.ImprovedCNN_v4",
+    }
+    if model_name not in models:
+        raise ValueError(f"Модель '{model_name}' не найдена. Доступные: {list(models.keys())}")
+
+    module_path, class_name = models[model_name].rsplit(".", 1)
+    module = __import__(module_path, fromlist=[class_name])
+    return getattr(module, class_name)(num_classes=num_classes)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2. КОНФИГУРАЦИЯ
 # ══════════════════════════════════════════════════════════════════════
 
 def get_config() -> argparse.Namespace:
-    """Параметры запуска через командную строку."""
-    parser = argparse.ArgumentParser(description="Обучение модели на EMNIST")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
 
-    # Эксперимент
-    parser.add_argument("--experiment", type=str, default="baseline",
-                        help="Название эксперимента (папка в results/)")
+    # Модель
+    parser.add_argument("--model", type=str, default="simple_cnn",
+                        choices=["simple_cnn", "improved_cnn_v2",
+                                 "improved_cnn_v3", "improved_cnn_v4"])
+    parser.add_argument("--experiment", type=str, default=None)
 
     # Данные
-    parser.add_argument("--data_dir",   type=str, default="data/raw",
-                        help="Папка с датасетом EMNIST")
-    parser.add_argument("--split",      type=str, default="balanced",
-                        choices=["balanced", "letters", "digits", "byclass"],
-                        help="Сплит EMNIST")
-    parser.add_argument("--num_classes",type=int, default=47,
-                        help="Число классов (47 для balanced)")
+    parser.add_argument("--data_dir",    type=str, default="data/raw")
+    parser.add_argument("--split",       type=str, default="balanced",
+                        choices=["balanced", "letters", "digits", "byclass"])
+    parser.add_argument("--num_classes", type=int, default=47)
+    parser.add_argument("--num_workers", type=int, default=2)
+
+    # ← Аугментация теперь управляется отсюда
+    parser.add_argument("--augmentation", type=str, default="light",
+                        choices=["none", "light", "strong"],
+                        help="Пресет аугментации из emnist_loader.py")
 
     # Обучение
-    parser.add_argument("--epochs",     type=int,   default=15)
-    parser.add_argument("--batch_size", type=int,   default=64)
-    parser.add_argument("--lr",         type=float, default=0.001)
-    parser.add_argument("--weight_decay",type=float,default=1e-4)
+    parser.add_argument("--epochs",       type=int,   default=15)
+    parser.add_argument("--batch_size",   type=int,   default=64)
+    parser.add_argument("--lr",           type=float, default=0.001)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
 
-    # Scheduler: lr умножается на gamma каждые step_size эпох
-    parser.add_argument("--step_size",  type=int,   default=5)
-    parser.add_argument("--gamma",      type=float, default=0.5)
+    # Scheduler
+    parser.add_argument("--scheduler", type=str, default="step",
+                        choices=["step", "cosine", "none"])
+    parser.add_argument("--step_size", type=int,   default=5)
+    parser.add_argument("--gamma",     type=float, default=0.5)
+
+    # Early stopping
+    parser.add_argument("--patience", type=int, default=0)
 
     # Сохранение
-    parser.add_argument("--save_every", type=int, default=5,
-                        help="Сохранять чекпоинт каждые N эпох (0 = только лучшую)")
+    parser.add_argument("--save_every", type=int, default=5)
 
     # TensorBoard
-    parser.add_argument("--no_tb", action="store_true",
-                        help="Отключить TensorBoard")
+    parser.add_argument("--no_tb", action="store_true")
 
     # Воспроизводимость
     parser.add_argument("--seed", type=int, default=42)
 
-    return parser.parse_args()
+    cfg = parser.parse_args()
+    if cfg.experiment is None:
+        cfg.experiment = cfg.model
+    return cfg
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. ДАННЫЕ
+# 3. SCHEDULER
 # ══════════════════════════════════════════════════════════════════════
 
-def get_dataloaders(cfg: argparse.Namespace):
-    """
-    Загружает EMNIST и возвращает train/test DataLoader'ы.
-    Данные скачиваются автоматически при первом запуске.
-    """
-    from torchvision import datasets, transforms
-
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),   # среднее/std EMNIST
-    ])
-
-    train_dataset = datasets.EMNIST(
-        root=cfg.data_dir,
-        split=cfg.split,
-        train=True,
-        download=True,
-        transform=transform,
-    )
-    test_dataset = datasets.EMNIST(
-        root=cfg.data_dir,
-        split=cfg.split,
-        train=False,
-        download=True,
-        transform=transform,
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-    )
-
-    return train_loader, test_loader
+def get_scheduler(cfg, optimizer):
+    if cfg.scheduler == "step":
+        return StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma)
+    elif cfg.scheduler == "cosine":
+        return CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 3. ОДНА ЭПОХА ОБУЧЕНИЯ
+# 4. ОДНА ЭПОХА ОБУЧЕНИЯ
 # ══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(
-    model:      nn.Module,
-    loader:     torch.utils.data.DataLoader,
-    optimizer:  torch.optim.Optimizer,
-    criterion:  nn.Module,
-    device:     torch.device,
-) -> tuple[float, float]:
-    """
-    Одна эпоха обучения.
-
-    Returns:
-        avg_loss: средний loss за эпоху
-        accuracy: точность в процентах
-    """
+def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
-
-    total_loss    = 0.0
-    total_correct = 0
-    total_samples = 0
+    total_loss, total_correct, total_samples = 0.0, 0, 0
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-
         outputs = model(images)
         loss    = criterion(outputs, labels)
-
         loss.backward()
         optimizer.step()
 
-        # Статистика
         total_loss    += loss.item() * images.size(0)
-        preds          = outputs.argmax(dim=1)
-        total_correct += (preds == labels).sum().item()
+        total_correct += (outputs.argmax(1) == labels).sum().item()
         total_samples += images.size(0)
 
-    avg_loss = total_loss / total_samples
-    accuracy = 100.0 * total_correct / total_samples
-
-    return avg_loss, accuracy
+    return total_loss / total_samples, 100.0 * total_correct / total_samples
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. ОЦЕНКА НА ТЕСТОВОЙ ВЫБОРКЕ
+# 5. ОЦЕНКА НА ТЕСТЕ
 # ══════════════════════════════════════════════════════════════════════
 
-def evaluate(
-    model:     nn.Module,
-    loader:    torch.utils.data.DataLoader,
-    criterion: nn.Module,
-    device:    torch.device,
-    collect_preds: bool = False,
-) -> tuple:
-    """
-    Оценка модели на тестовой выборке.
-
-    Args:
-        collect_preds: если True — возвращает также images, labels, preds
-                       (нужно для confusion matrix и примеров)
-
-    Returns:
-        avg_loss, accuracy  — всегда
-        images, labels, preds  — только если collect_preds=True
-    """
+def evaluate(model, loader, criterion, device, collect_preds=False):
     model.eval()
-
-    total_loss    = 0.0
-    total_correct = 0
-    total_samples = 0
-
-    all_labels = []
-    all_preds  = []
-    sample_images = []  # небольшой буфер для примеров
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+    all_labels, all_preds, sample_images = [], [], []
 
     with torch.no_grad():
         for images, labels in loader:
@@ -206,17 +147,15 @@ def evaluate(
 
             outputs = model(images)
             loss    = criterion(outputs, labels)
+            preds   = outputs.argmax(1)
 
             total_loss    += loss.item() * images.size(0)
-            preds          = outputs.argmax(dim=1)
             total_correct += (preds == labels).sum().item()
             total_samples += images.size(0)
 
             if collect_preds:
                 all_labels.extend(labels.cpu().tolist())
                 all_preds.extend(preds.cpu().tolist())
-
-                # Сохраняем первые 10 изображений для visualize
                 if len(sample_images) < 10:
                     n = min(10 - len(sample_images), images.size(0))
                     sample_images.extend(images[:n].cpu())
@@ -226,64 +165,58 @@ def evaluate(
 
     if collect_preds:
         return avg_loss, accuracy, sample_images, all_labels, all_preds
-
     return avg_loss, accuracy
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 5. ГЛАВНАЯ ФУНКЦИЯ ОБУЧЕНИЯ
+# 6. ГЛАВНАЯ ФУНКЦИЯ
 # ══════════════════════════════════════════════════════════════════════
 
 def train(cfg: argparse.Namespace):
-    """Полный цикл обучения: инициализация → обучение → сохранение итогов."""
 
-    # ── Воспроизводимость ──────────────────────────────────────────────
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
 
-    # ── Устройство ────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Логгер ────────────────────────────────────────────────────────
     exp_logger = ExperimentLogger(
         experiment_name=cfg.experiment,
         use_tensorboard=not cfg.no_tb,
     )
-    log = exp_logger.logger   # удобный псевдоним
+    log = exp_logger.logger
+    log.info(f"Устройство: {device} | Модель: {cfg.model} | Seed: {cfg.seed}")
 
-    log.info(f"Устройство: {device}")
-    log.info(f"Seed: {cfg.seed}")
-
-    # ── Данные ────────────────────────────────────────────────────────
-    log.info("Загрузка EMNIST...")
-    train_loader, test_loader = get_dataloaders(cfg)
+    # ── Данные ← теперь из отдельного файла ───────────────────────────
+    log.info(f"Загрузка EMNIST (аугментация: {cfg.augmentation})...")
+    train_loader, test_loader = get_dataloaders(
+        data_dir=cfg.data_dir,
+        split=cfg.split,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        augmentation=cfg.augmentation,        # ← передаём пресет
+    )
     log.info(f"Train: {len(train_loader.dataset):,} | "
-             f"Test: {len(test_loader.dataset):,} | "
-             f"Батч: {cfg.batch_size}")
+             f"Test:  {len(test_loader.dataset):,} | "
+             f"Батч:  {cfg.batch_size}")
 
     # ── Модель ────────────────────────────────────────────────────────
-    # Импортируем здесь — легко поменять на другую модель
-    from src.models.simple_cnn import SimpleCNN
-    model = SimpleCNN(num_classes=cfg.num_classes).to(device)
-
-    # ── Параметры обучения ────────────────────────────────────────────
+    model     = get_model(cfg.model, cfg.num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-    scheduler = StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma)
+    optimizer = optim.Adam(model.parameters(),
+                           lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = get_scheduler(cfg, optimizer)
 
-    # ── Инфо о модели → логгер + TensorBoard ──────────────────────────
+    # ── Инфо о модели ─────────────────────────────────────────────────
     model_params = {
+        "model":        cfg.model,
         "optimizer":    "Adam",
         "lr":           cfg.lr,
         "weight_decay": cfg.weight_decay,
         "batch_size":   cfg.batch_size,
         "epochs":       cfg.epochs,
-        "scheduler":    f"StepLR(step={cfg.step_size}, gamma={cfg.gamma})",
+        "scheduler":    cfg.scheduler,
+        "augmentation": get_augmentation_info(cfg.augmentation),  # ← описание
         "split":        cfg.split,
         "num_classes":  cfg.num_classes,
         "seed":         cfg.seed,
@@ -292,9 +225,11 @@ def train(cfg: argparse.Namespace):
     exp_logger.log_model_info(model, model_params, sample_input)
 
     # ══════════════════════════════════════════════════════════════════
-    # ГЛАВНЫЙ ЦИКЛ ОБУЧЕНИЯ
+    # ГЛАВНЫЙ ЦИКЛ
     # ══════════════════════════════════════════════════════════════════
     log.info("\nСТАРТ ОБУЧЕНИЯ\n" + "-" * 60)
+
+    epochs_no_improve = 0
 
     for epoch in range(1, cfg.epochs + 1):
 
@@ -306,52 +241,50 @@ def train(cfg: argparse.Namespace):
                 model, test_loader, criterion, device
             )
 
-        # Обновляем lr
-        scheduler.step()
-        exp_logger.log_learning_rate(optimizer, epoch)
+        if scheduler:
+            scheduler.step()
+            exp_logger.log_learning_rate(optimizer, epoch)
 
-        # Логируем эпоху (файл + CSV + TensorBoard)
         exp_logger.log_epoch(
             epoch, cfg.epochs,
             train_loss, train_acc,
-            test_loss, test_acc,
+            test_loss,  test_acc,
             t.duration,
         )
 
-        # Гистограммы весов раз в 5 эпох
         if epoch % 5 == 0:
             exp_logger.log_gradients(model, epoch)
 
-        # Сохраняем лучшую модель
-        is_best = (test_acc >= exp_logger.best_acc)
+        is_best = test_acc >= exp_logger.best_acc
         if is_best:
             exp_logger.save_model(model, epoch, is_best=True)
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
-        # Чекпоинт каждые N эпох
         if cfg.save_every > 0 and epoch % cfg.save_every == 0:
             exp_logger.save_model(model, epoch, is_best=False)
 
+        if cfg.patience > 0 and epochs_no_improve >= cfg.patience:
+            log.info(f"\nEarly stopping на эпохе {epoch} "
+                     f"(нет улучшений {cfg.patience} эпох)")
+            break
+
     # ══════════════════════════════════════════════════════════════════
-    # ФИНАЛЬНАЯ ОЦЕНКА + ВИЗУАЛИЗАЦИЯ
+    # ФИНАЛЬНАЯ ОЦЕНКА
     # ══════════════════════════════════════════════════════════════════
     log.info("\nФИНАЛЬНАЯ ОЦЕНКА...")
-
     _, _, sample_images, all_labels, all_preds = evaluate(
         model, test_loader, criterion, device, collect_preds=True
     )
 
-    # Матрица ошибок
     cm = confusion_matrix(all_labels, all_preds)
     exp_logger.log_confusion_matrix(cm)
-
-    # Примеры предсказаний
     exp_logger.log_example_predictions(
         images=sample_images,
         labels=all_labels[:10],
         predictions=all_preds[:10],
     )
-
-    # Итоговый отчёт
     exp_logger.log_final_summary()
     exp_logger.close()
 
