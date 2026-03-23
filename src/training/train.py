@@ -15,8 +15,8 @@ from sklearn.metrics import confusion_matrix
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.logger import ExperimentLogger, Timer
-from src.dataset.emnist_loader import get_dataloaders, get_augmentation_info  # ← импорт
-
+from src.dataset.emnist_loader import get_dataloaders, get_augmentation_info  
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # ══════════════════════════════════════════════════════════════════════
 # 1. РЕЕСТР МОДЕЛЕЙ
@@ -72,7 +72,7 @@ def get_config() -> argparse.Namespace:
 
     # Scheduler
     parser.add_argument("--scheduler", type=str, default="step",
-                        choices=["step", "cosine", "none"])
+                    choices=["step", "cosine", "plateau", "none"])
     parser.add_argument("--step_size", type=int,   default=5)
     parser.add_argument("--gamma",     type=float, default=0.5)
 
@@ -103,6 +103,14 @@ def get_scheduler(cfg, optimizer):
         return StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma)
     elif cfg.scheduler == "cosine":
         return CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
+    elif cfg.scheduler == "plateau":
+        return ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=0.5,
+            patience=2,
+            min_lr=1e-6,   # ← чтобы lr не ушёл в 0
+            verbose=True)
     return None
 
 
@@ -242,9 +250,10 @@ def train(cfg: argparse.Namespace):
             )
 
         if scheduler:
-            scheduler.step()
-            exp_logger.log_learning_rate(optimizer, epoch)
-
+            if cfg.scheduler == "plateau":
+                scheduler.step(test_acc)
+            else:
+                scheduler.step()
         exp_logger.log_epoch(
             epoch, cfg.epochs,
             train_loss, train_acc,
