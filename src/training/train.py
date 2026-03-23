@@ -254,6 +254,8 @@ def train(cfg: argparse.Namespace):
                 scheduler.step(test_acc)
             else:
                 scheduler.step()
+            exp_logger.log_learning_rate(optimizer, epoch)  
+
         exp_logger.log_epoch(
             epoch, cfg.epochs,
             train_loss, train_acc,
