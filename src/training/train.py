@@ -110,7 +110,7 @@ def get_scheduler(cfg, optimizer):
             factor=0.5,
             patience=2,
             min_lr=1e-6,   # ← чтобы lr не ушёл в 0
-            verbose=True)
+            )
     return None
 
 
