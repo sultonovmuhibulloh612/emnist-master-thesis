@@ -28,7 +28,9 @@ def get_model(model_name: str, num_classes: int) -> nn.Module:
         "improved_cnn_v2": "src.models.improved_cnn_v2.ImprovedCNN_v2",
         "improved_cnn_v3": "src.models.improved_cnn_v3.ImprovedCNN_v3",
         "improved_cnn_v4": "src.models.improved_cnn_v4.ImprovedCNN_v4",
-    }
+        "improved_cnn_v5": "src.models.improved_cnn_v5.ImprovedCNN_v5",  
+        "improved_cnn_v7": "src.models.improved_cnn_v7.ImprovedCNN_v7",
+    }  
     if model_name not in models:
         raise ValueError(f"Модель '{model_name}' не найдена. Доступные: {list(models.keys())}")
 
@@ -49,7 +51,8 @@ def get_config() -> argparse.Namespace:
     # Модель
     parser.add_argument("--model", type=str, default="simple_cnn",
                         choices=["simple_cnn", "improved_cnn_v2",
-                                 "improved_cnn_v3", "improved_cnn_v4"])
+                                 "improved_cnn_v3", "improved_cnn_v4",
+                                 "improved_cnn_v5", "improved_cnn_v7"])
     parser.add_argument("--experiment", type=str, default=None)
 
     # Данные
@@ -207,18 +210,17 @@ def train(cfg: argparse.Namespace):
     log.info(f"Train: {len(train_loader.dataset):,} | "
              f"Test:  {len(test_loader.dataset):,} | "
              f"Батч:  {cfg.batch_size}")
-
     # ── Модель ────────────────────────────────────────────────────────
     model     = get_model(cfg.model, cfg.num_classes).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(),
-                           lr=cfg.lr, weight_decay=cfg.weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)        # ← было: ()
+    optimizer = optim.AdamW(model.parameters(),                 # ← было: optim.Adam
+                            lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = get_scheduler(cfg, optimizer)
 
     # ── Инфо о модели ─────────────────────────────────────────────────
     model_params = {
         "model":        cfg.model,
-        "optimizer":    "Adam",
+        "optimizer":    "AdamW" ,
         "lr":           cfg.lr,
         "weight_decay": cfg.weight_decay,
         "batch_size":   cfg.batch_size,
@@ -228,6 +230,7 @@ def train(cfg: argparse.Namespace):
         "split":        cfg.split,
         "num_classes":  cfg.num_classes,
         "seed":         cfg.seed,
+        "label_smoothing": 0.1
     }
     sample_input = torch.zeros(1, 1, 28, 28).to(device)
     exp_logger.log_model_info(model, model_params, sample_input)
