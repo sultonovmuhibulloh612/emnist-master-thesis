@@ -189,7 +189,7 @@ def train(cfg: argparse.Namespace):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     exp_logger = ExperimentLogger(
         experiment_name=cfg.experiment,
