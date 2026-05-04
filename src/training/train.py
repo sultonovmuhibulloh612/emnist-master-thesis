@@ -6,17 +6,17 @@ import argparse
 import sys
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR, ReduceLROnPlateau
 from sklearn.metrics import confusion_matrix
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.utils.logger import ExperimentLogger, Timer
-from src.dataset.emnist_loader import get_dataloaders, get_augmentation_info  
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from src.dataset.emnist_loader import get_dataloaders, get_augmentation_info
 
 # ══════════════════════════════════════════════════════════════════════
 # 1. РЕЕСТР МОДЕЛЕЙ
@@ -28,9 +28,9 @@ def get_model(model_name: str, num_classes: int) -> nn.Module:
         "improved_cnn_v2": "src.models.improved_cnn_v2.ImprovedCNN_v2",
         "improved_cnn_v3": "src.models.improved_cnn_v3.ImprovedCNN_v3",
         "improved_cnn_v4": "src.models.improved_cnn_v4.ImprovedCNN_v4",
-        "improved_cnn_v5": "src.models.improved_cnn_v5.ImprovedCNN_v5",  
+        "improved_cnn_v5": "src.models.improved_cnn_v5.ImprovedCNN_v5",
         "improved_cnn_v7": "src.models.improved_cnn_v7.ImprovedCNN_v7",
-    }  
+    }
     if model_name not in models:
         raise ValueError(f"Модель '{model_name}' не найдена. Доступные: {list(models.keys())}")
 
@@ -62,10 +62,14 @@ def get_config() -> argparse.Namespace:
     parser.add_argument("--num_classes", type=int, default=47)
     parser.add_argument("--num_workers", type=int, default=2)
 
-    # ← Аугментация теперь управляется отсюда
+    # Аугментация
     parser.add_argument("--augmentation", type=str, default="light",
                         choices=["none", "light", "strong"],
                         help="Пресет аугментации из emnist_loader.py")
+
+    # Mixup регуляризация
+    parser.add_argument("--mixup_alpha", type=float, default=0.0,
+                        help="Mixup α: 0 = выключено; 0.2 рекомендуется для EMNIST")
 
     # Обучение
     parser.add_argument("--epochs",       type=int,   default=15)
@@ -112,16 +116,22 @@ def get_scheduler(cfg, optimizer):
             mode='max',
             factor=0.5,
             patience=2,
-            min_lr=1e-6,   # ← чтобы lr не ушёл в 0
+            min_lr=1e-6,
             )
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. ОДНА ЭПОХА ОБУЧЕНИЯ
+# 4. ОДНА ЭПОХА ОБУЧЕНИЯ (с поддержкой Mixup)
 # ══════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, mixup_alpha=0.0):
+    """
+    Одна эпоха обучения. При mixup_alpha > 0 применяется Mixup-регуляризация:
+        x_mixed = λ·x_i + (1-λ)·x_j
+        loss    = λ·CE(out, y_i) + (1-λ)·CE(out, y_j)
+        где λ ~ Beta(α, α)
+    """
     model.train()
     total_loss, total_correct, total_samples = 0.0, 0, 0
 
@@ -129,14 +139,33 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        # ── Mixup ────────────────────────────────────────────────────
+        if mixup_alpha > 0:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+            idx = torch.randperm(images.size(0), device=device)
+
+            images_mixed = lam * images + (1 - lam) * images[idx]
+            labels_a, labels_b = labels, labels[idx]
+
+            outputs = model(images_mixed)
+            loss = (lam * criterion(outputs, labels_a)
+                    + (1 - lam) * criterion(outputs, labels_b))
+
+            preds = outputs.argmax(1)
+            # Точность считаем приближённо — взвешенно по обеим меткам
+            total_correct += (lam * (preds == labels_a).sum().item()
+                              + (1 - lam) * (preds == labels_b).sum().item())
+        # ── Без Mixup (стандарт) ─────────────────────────────────────
+        else:
+            outputs = model(images)
+            loss    = criterion(outputs, labels)
+            total_correct += (outputs.argmax(1) == labels).sum().item()
+
         optimizer.zero_grad()
-        outputs = model(images)
-        loss    = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 
         total_loss    += loss.item() * images.size(0)
-        total_correct += (outputs.argmax(1) == labels).sum().item()
         total_samples += images.size(0)
 
     return total_loss / total_samples, 100.0 * total_correct / total_samples
@@ -186,6 +215,7 @@ def evaluate(model, loader, criterion, device, collect_preds=False):
 def train(cfg: argparse.Namespace):
 
     torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
 
@@ -197,40 +227,44 @@ def train(cfg: argparse.Namespace):
     )
     log = exp_logger.logger
     log.info(f"Устройство: {device} | Модель: {cfg.model} | Seed: {cfg.seed}")
+    if cfg.mixup_alpha > 0:
+        log.info(f"Mixup ВКЛ: α = {cfg.mixup_alpha}")
 
-    # ── Данные ← теперь из отдельного файла ───────────────────────────
+    # ── Данные ────────────────────────────────────────────────────────
     log.info(f"Загрузка EMNIST (аугментация: {cfg.augmentation})...")
     train_loader, test_loader = get_dataloaders(
         data_dir=cfg.data_dir,
         split=cfg.split,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
-        augmentation=cfg.augmentation,        # ← передаём пресет
+        augmentation=cfg.augmentation,
     )
     log.info(f"Train: {len(train_loader.dataset):,} | "
              f"Test:  {len(test_loader.dataset):,} | "
              f"Батч:  {cfg.batch_size}")
+
     # ── Модель ────────────────────────────────────────────────────────
     model     = get_model(cfg.model, cfg.num_classes).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)        # ← было: ()
-    optimizer = optim.AdamW(model.parameters(),                 # ← было: optim.Adam
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(model.parameters(),
                             lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = get_scheduler(cfg, optimizer)
 
     # ── Инфо о модели ─────────────────────────────────────────────────
     model_params = {
-        "model":        cfg.model,
-        "optimizer":    "AdamW" ,
-        "lr":           cfg.lr,
-        "weight_decay": cfg.weight_decay,
-        "batch_size":   cfg.batch_size,
-        "epochs":       cfg.epochs,
-        "scheduler":    cfg.scheduler,
-        "augmentation": get_augmentation_info(cfg.augmentation),  # ← описание
-        "split":        cfg.split,
-        "num_classes":  cfg.num_classes,
-        "seed":         cfg.seed,
-        "label_smoothing": 0.1
+        "model":           cfg.model,
+        "optimizer":       "AdamW",
+        "lr":              cfg.lr,
+        "weight_decay":    cfg.weight_decay,
+        "batch_size":      cfg.batch_size,
+        "epochs":          cfg.epochs,
+        "scheduler":       cfg.scheduler,
+        "augmentation":    get_augmentation_info(cfg.augmentation),
+        "split":           cfg.split,
+        "num_classes":     cfg.num_classes,
+        "seed":            cfg.seed,
+        "label_smoothing": 0.1,
+        "mixup_alpha":     cfg.mixup_alpha,
     }
     sample_input = torch.zeros(1, 1, 28, 28).to(device)
     exp_logger.log_model_info(model, model_params, sample_input)
@@ -246,7 +280,8 @@ def train(cfg: argparse.Namespace):
 
         with Timer() as t:
             train_loss, train_acc = train_one_epoch(
-                model, train_loader, optimizer, criterion, device
+                model, train_loader, optimizer, criterion, device,
+                mixup_alpha=cfg.mixup_alpha,
             )
             test_loss, test_acc = evaluate(
                 model, test_loader, criterion, device
@@ -257,7 +292,7 @@ def train(cfg: argparse.Namespace):
                 scheduler.step(test_acc)
             else:
                 scheduler.step()
-            exp_logger.log_learning_rate(optimizer, epoch)  
+            exp_logger.log_learning_rate(optimizer, epoch)
 
         exp_logger.log_epoch(
             epoch, cfg.epochs,
