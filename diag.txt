@@ -1,0 +1,9 @@
+﻿FAIL  c10.dll  winerror=1114  ��������� ���� � ��������� ������������� ���������� ������������ ���������� (DLL)
+OK    libiomp5md.dll
+OK    libiompstubs5md.dll
+FAIL  shm.dll  winerror=1114  ��������� ���� � ��������� ������������� ���������� ������������ ���������� (DLL)
+OK    torch.dll
+FAIL  torch_cpu.dll  winerror=1114  ��������� ���� � ��������� ������������� ���������� ������������ ���������� (DLL)
+OK    torch_global_deps.dll
+FAIL  torch_python.dll  winerror=1114  ��������� ���� � ��������� ������������� ���������� ������������ ���������� (DLL)
+OK    uv.dll
