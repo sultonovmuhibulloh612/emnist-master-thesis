@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Распознавание рукописных символов | EMNIST | improved_cnn_v5</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Распознавание рукописных символов</h1>
+            <p class="subtitle">Модель improved_cnn_v5 • EMNIST Balanced (47 классов) • ONNX Runtime Web</p>
+        </header>
+
+        <main>
+            <div class="canvas-section">
+                <div class="canvas-wrapper">
+                    <label class="canvas-label">Нарисуйте символ:</label>
+                    <canvas 
+                        id="drawCanvas" 
+                        width="280" 
+                        height="280"
+                        aria-label="Холст для рисования символа"
+                    ></canvas>
+                    <div class="canvas-hint">Рисуйте мышью или пальцем (на сенсорном экране)</div>
+                </div>
+
+                <div class="controls">
+                    <button id="recognizeBtn" class="btn btn-primary">
+                        <span class="btn-icon">🔍</span> Распознать
+                    </button>
+                    <button id="clearBtn" class="btn btn-secondary">
+                        <span class="btn-icon">🗑️</span> Очистить
+                    </button>
+                    <label class="toggle-label">
+                        <input type="checkbox" id="transposeToggle">
+                        Транспонировать (EMNIST-ориентация)
+                    </label>
+                </div>
+
+                <div class="preview-section">
+                    <label class="canvas-label">Что видит модель (28×28):</label>
+                    <canvas 
+                        id="previewCanvas" 
+                        width="112" 
+                        height="112"
+                        class="preview-canvas"
+                    ></canvas>
+                </div>
+            </div>
+
+            <div class="results-section">
+                <div id="status" class="status">
+                    <div id="loadingIndicator" class="loading" style="display: none;">
+                        <div class="spinner"></div>
+                        <span>Загрузка модели...</span>
+                    </div>
+                    <div id="errorMessage" class="error" style="display: none;"></div>
+                </div>
+
+                <div id="results" class="results" style="display: none;">
+                    <h2>Результаты распознавания</h2>
+                    <div id="predictions" class="predictions"></div>
+                    <div id="inferenceTime" class="inference-time"></div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>Магистерская диссертация, 2026 • 
+               <a href="https://github.com/sultonovmuhibulloh612/emnist-master-thesis" target="_blank">GitHub</a> • 
+               Модель: improved_cnn_v5 (91.15% точности, 712K параметров)
+            </p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
